@@ -125,7 +125,7 @@ async function fredYoY(id, label) {
   if (!prev) throw new Error(`FRED ${id} 1년 전 값 없음`);
   return {
     label, value: r2((v / prev[1] - 1) * 100), unit: "%", asOf: d,
-    source: `FRED ${id} · 1년 전 같은 달과 비교`, kind: "live", note: "한 달에 한 번 발표",
+    source: `FRED ${id} · 1년 전 같은 달과 비교`, kind: "monthly", note: "한 달에 한 번 발표",
   };
 }
 
