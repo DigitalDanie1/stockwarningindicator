@@ -1,4 +1,5 @@
 import { getJson, getText, yahooChart, CNN_HEADERS, FALLBACK, FALLBACK_AS_OF } from "./_lib.js";
+import { buildKr } from "./_kr.js";
 
 const QUOTES = {
   sp500: ["S&P 500", "^GSPC", ""],
@@ -13,21 +14,20 @@ const QUOTES = {
   btc: ["비트코인", "BTC-USD", "$"],
 };
 
-// 버핏 지수·CAPE는 분기/연간 데이터라 앵커 × 지수 변화로 어림
+// 실시간 소스가 죽었을 때만 쓰는 어림용 앵커
 const ANCHOR = { date: "2026-09-01", sp500: 7636.36, buffett: 227.1, cape: 38.0 };
 
-// 한국 지표는 공개 API가 없어 직접 입력값
-const KR_DRIVERS = [
+// 한국 지표 수집 실패 시 마지막 저장값
+const KR_FALLBACK = [
   { id: "pbr", name: "PBR", unit: "배", raw: 1.1, score: 52, weight: 1 },
   { id: "fper", name: "선행 PER", unit: "배", raw: 10.5, score: 48.5, weight: 0.9 },
   { id: "credit", name: "신용/시총", unit: "%", raw: 0.7, score: 58, weight: 0.85 },
   { id: "foreign", name: "외국인 3M", unit: "조", raw: 8, score: 65.2, weight: 0.75 },
   { id: "samsung", name: "삼성 비중", unit: "%", raw: 22, score: 55, weight: 0.7 },
   { id: "turnover", name: "회전율", unit: "%", raw: 0.6, score: 55, weight: 0.6 },
-  { id: "pension", name: "연기금 3M순매수", unit: "조", raw: -2, score: 58, weight: 0.8 },
-  { id: "ipo", name: "IPO 월간", unit: "건", raw: 5, score: 42, weight: 0.65 },
+  { id: "inst", name: "기관 3M 순매수", unit: "조", raw: -2, score: 58, weight: 0.8 },
+  { id: "ipo", name: "IPO 30일", unit: "건", raw: 5, score: 42, weight: 0.65 },
 ];
-const KR_AS_OF = "2026-09-01";
 
 const r2 = (x) => Math.round(x * 100) / 100;
 const r1 = (x) => Math.round(x * 10) / 10;
@@ -136,6 +136,27 @@ async function fredHy() {
   return { label: "회사 빚 이자", value: v, unit: "%p", asOf: d, source: "FRED BAMLH0A0HYM2", kind: "live", note: "하루 한 번 갱신" };
 }
 
+// 버핏 지수 = 윌셔 5000 ÷ 미국 명목 GDP (FRED, 분기)
+async function buffettLive() {
+  const [w, gdpRows] = await Promise.all([
+    yahooChart("^W5000", { range: "1d", interval: "15m" }),
+    fredSeries("GDP", `${new Date().getUTCFullYear() - 2}-01-01`),
+  ]);
+  const [gd, gdp] = gdpRows[gdpRows.length - 1];
+  const v = w.meta.regularMarketPrice;
+  if (!Number.isFinite(v) || !gdp) throw new Error("W5000/GDP 없음");
+  return { label: "버핏 지수", value: r1((v / gdp) * 100), unit: "%", asOf: new Date(w.meta.regularMarketTime * 1000).toISOString(), source: `윌셔 5000 ÷ GDP(${gd} 분기, FRED)`, kind: "derived", note: "주식 전체 값 ÷ 나라 전체 소득" };
+}
+
+// CAPE — multpl.com 월간 실러 PER
+async function capeLive() {
+  const html = await getText("https://www.multpl.com/shiller-pe", { headers: { "User-Agent": CNN_HEADERS["User-Agent"] } });
+  const m = html.match(/id="current">[\s\S]*?<\/b>\s*([\d.]+)/);
+  const v = m && Number(m[1]);
+  if (!Number.isFinite(v) || v < 5 || v > 80) throw new Error("multpl 파싱 실패");
+  return { label: "CAPE", value: r1(v), unit: "배", asOf: new Date().toISOString(), source: "multpl.com · 실러 PER", kind: "live", note: "지난 10년 평균 이익으로 잰 주가 수준" };
+}
+
 // S&P 2년 일봉 → 200일 평균 거리, RSI(14)
 async function spxTechnicals() {
   const res = await yahooChart("^GSPC", { range: "2y", interval: "1d" });
@@ -177,8 +198,11 @@ export async function buildMarket() {
     }
   };
 
-  let tech = null;
+  let tech = null, kr = null;
   await Promise.all([
+    settle("buffett", "버핏 지수", "%", buffettLive),
+    settle("cape", "CAPE", "배", capeLive),
+    buildKr().then((k) => (kr = k)).catch((e) => errors.push(`kr: ${e.message}`)),
     ...Object.entries(QUOTES).map(([k, [label, , unit]]) => settle(k, label, unit, () => quote(k))),
     settle("kospi", "코스피", "", () => naver("KOSPI", "코스피")),
     settle("kosdaq", "코스닥", "", () => naver("KOSDAQ", "코스닥")),
@@ -194,12 +218,13 @@ export async function buildMarket() {
   const m = metrics;
   m.curve = { label: "금리 곡선", value: r2(m.dgs10.value - m.bill3m.value), unit: "%p", asOf: m.dgs10.asOf, source: "Yahoo ^TNX − ^IRX", kind: "derived" };
   const spRatio = m.sp500.value / ANCHOR.sp500;
-  m.buffett = { label: "버핏 지수", value: r1(ANCHOR.buffett * spRatio), unit: "%", asOf: m.sp500.asOf, source: `앵커 ${ANCHOR.date} × 지수/GDP`, kind: "estimate", note: "나라 전체 소득은 석 달에 한 번만 나와서 어림잡음" };
-  m.cape = { label: "CAPE", value: r1(ANCHOR.cape * spRatio), unit: "배", asOf: m.sp500.asOf, source: `앵커 ${ANCHOR.date} × 지수`, kind: "estimate", note: "회사 이익은 그대로라고 놓고 어림잡음" };
+  if (m.buffett.kind === "snapshot") m.buffett = { label: "버핏 지수", value: r1(ANCHOR.buffett * spRatio), unit: "%", asOf: m.sp500.asOf, source: `앵커 ${ANCHOR.date} × 지수 (실시간 실패)`, kind: "estimate" };
+  if (m.cape.kind === "snapshot") m.cape = { label: "CAPE", value: r1(ANCHOR.cape * spRatio), unit: "배", asOf: m.sp500.asOf, source: `앵커 ${ANCHOR.date} × 지수 (실시간 실패)`, kind: "estimate" };
+  if (kr) errors.push(...kr.errors.map((e) => `kr ${e}`));
 
   // 화면에 그리는 순서 유지
   const order = ["sp500", "nasdaq", "dow", "vix", "dgs10", "bill3m", "dxy", "gold", "wti", "btc", "kospi", "kosdaq", "fg", "curve", "ma200", "rsi", "buffett", "cape", "coreCpi", "headlineCpi", "hy"];
-  const ordered = Object.fromEntries(order.map((k) => [k, m[k]]));
+  const ordered = { ...Object.fromEntries(order.map((k) => [k, m[k]])), ...(kr?.metrics ?? {}) };
 
   const d = (id, name, unit, raw, score, weight) => ({ id, name, unit, raw, score: r1(score), weight });
   const usDrivers = [
@@ -210,7 +235,7 @@ export async function buildMarket() {
     d("ma200", "200일 평균과의 거리", "%", m.ma200.value, SCORE.ma200(m.ma200.value), 0.8),
     d("rsi", "RSI(14)", "", m.rsi.value, SCORE.rsi(m.rsi.value), 0.6),
   ];
-  const usLive = ["vix", "fg", "ma200", "rsi"].filter((k) => m[k].kind !== "snapshot").length;
+  const usLive = ["buffett", "cape", "vix", "fg", "ma200", "rsi"].filter((k) => !["snapshot", "estimate"].includes(m[k].kind)).length;
   const macroDrivers = [
     d("dgs10", "미국 10년 국채 이자", "%", m.dgs10.value, SCORE.dgs10(m.dgs10.value), 1),
     d("coreCpi", "Core CPI YoY", "%", m.coreCpi.value, SCORE.coreCpi(m.coreCpi.value), 1),
@@ -233,8 +258,10 @@ export async function buildMarket() {
     errors,
     metrics: ordered,
     scores: {
-      us: composite("미국 주식, 비싼가?", usDrivers, "live", `지표 6개로 계산 · 실시간 ${usLive} + 어림 2`),
-      kr: composite("한국 주식은?", KR_DRIVERS, "manual", `직접 입력 · ${KR_AS_OF} 기준`),
+      us: composite("미국 주식, 비싼가?", usDrivers, "live", usLive === 6 ? "지표 6개 모두 자동 수집" : `지표 6개 · 자동 ${usLive} + 어림 ${6 - usLive}`),
+      kr: kr?.drivers?.length >= 6
+        ? composite("한국 주식은?", kr.drivers, "live", `자동 수집 ${kr.drivers.length}개 · 네이버 증권·금융투자협회`)
+        : composite("한국 주식은?", KR_FALLBACK, "manual", "수집 실패 · 마지막 저장값"),
       macro: composite("경제는 버틸까?", macroDrivers, "live", "이자·물가·돈줄·금리곡선·공포지수"),
     },
   };
