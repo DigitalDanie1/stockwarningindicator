@@ -234,7 +234,10 @@ export async function buildMarket() {
     liveTotal: liveKeys.length,
     errors,
     metrics: ordered,
-    history: hist ? { us: hist.usHistory.map(({ d, v }, i, all) => ({ d, v: i === all.length - 1 ? usComposite.value : v })) } : null,
+    history: hist ? {
+      us: hist.usHistory.map(({ d, v }, i, all) => ({ d, v: i === all.length - 1 ? usComposite.value : v })),
+      trend: Object.fromEntries(Object.entries(hist.trend).map(([k, arr]) => [k, arr.map((p, i) => (i === arr.length - 1 ? { ...p, v: usComposite.value, spx: Math.round(m.sp500.value) } : p))])),
+    } : null,
     series: hist ? { spxMonthly: hist.spxMonthly, nvda: hist.nvda } : null,
     scores: {
       us: usComposite,
