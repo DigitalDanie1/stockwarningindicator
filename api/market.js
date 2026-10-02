@@ -235,7 +235,7 @@ export async function buildMarket() {
     errors,
     metrics: ordered,
     history: hist ? { us: hist.usHistory.map(({ d, v }, i, all) => ({ d, v: i === all.length - 1 ? usComposite.value : v })) } : null,
-    series: hist ? { spxMonthly: hist.spxMonthly } : null,
+    series: hist ? { spxMonthly: hist.spxMonthly, nvda: hist.nvda } : null,
     scores: {
       us: usComposite,
       kr: kr?.drivers?.length >= 6

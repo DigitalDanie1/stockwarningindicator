@@ -49,13 +49,39 @@ function technicalsAt(closes, idx) {
   return { ma200: r1((closes[idx] / sma - 1) * 100), rsi: r1(100 - 100 / (1 + g / l)) };
 }
 
+// 엔비디아 주가 vs 순이익 (2020년 = 100). 이익은 1월 결산 회계연도 → 그 전 해 달력연도로 표시
+const NV_NI_FIXED = { 2020: 4332, 2021: 9752, 2022: 4368 }; // FY2021~FY2023 10-K, 백만 달러
+async function nvdaSeries(nvM) {
+  const H = { "User-Agent": CNN_HEADERS["User-Agent"] };
+  const [ann, qtr] = await Promise.all([
+    getJson("https://api.stock.naver.com/stock/NVDA.O/finance/annual", { headers: H }),
+    getJson("https://api.stock.naver.com/stock/NVDA.O/finance/quarter", { headers: H }),
+  ]);
+  const ni = (d) => d.rowList.find((r) => r.title === "당기순이익").columns;
+  const num = (v) => Number(String(v).replace(/,/g, ""));
+  const byYear = { ...NV_NI_FIXED };
+  for (const [k, v] of Object.entries(ni(ann))) byYear[Number(k.slice(0, 4)) - 1] = num(v.value);
+  const qs = Object.entries(ni(qtr)).sort(([a], [b]) => a.localeCompare(b)).slice(-4);
+  const ttm = qs.length === 4 ? qs.reduce((a, [, v]) => a + num(v.value), 0) : null;
+  const years = Object.keys(byYear).map(Number).sort();
+  const p0 = nvM.get("2020-12"), e0 = byYear[2020];
+  const price = years.map((y) => nvM.get(`${y}-12`)).map((v) => (v ? Math.round((v / p0) * 100) : null));
+  const earnings = years.map((y) => Math.round((byYear[y] / e0) * 100));
+  const now = [...nvM.values()].pop();
+  return {
+    years: [...years.map(String), "현재"],
+    price: [...price, Math.round((now / p0) * 100)],
+    earnings: [...earnings, ttm ? Math.round((ttm / e0) * 100) : null],
+  };
+}
+
 let cache = null;
 export async function buildHistory() {
   if (cache && Date.now() - cache.at < 60 * 60e3) return cache.data;
   const safe = (p) => p.catch(() => null);
-  const [spxM, vixM, wM, daily, cape, gdp, fg] = await Promise.all([
+  const [spxM, vixM, wM, daily, cape, gdp, fg, nvM] = await Promise.all([
     monthlyCloses("^GSPC", "10y"), safe(monthlyCloses("^VIX")), safe(monthlyCloses("^W5000")),
-    yahooChart("^GSPC", { range: "2y", interval: "1d" }), safe(capeByMonth()), safe(gdpQuarterly()), safe(fgDaily()),
+    yahooChart("^GSPC", { range: "2y", interval: "1d" }), safe(capeByMonth()), safe(gdpQuarterly()), safe(fgDaily()), safe(monthlyCloses("NVDA", "10y")),
   ]);
 
   const ts = daily.timestamp, closesRaw = daily.indicators.quote[0].close;
@@ -86,7 +112,8 @@ export async function buildHistory() {
   });
 
   const spxMonthly = [...spxM].filter(([d]) => d >= "2019-01").map(([d, v]) => ({ d, v: Math.round(v * 100) / 100 }));
-  const data = { usHistory: us, spxMonthly };
+  const nvda = nvM ? await nvdaSeries(nvM).catch(() => null) : null;
+  const data = { usHistory: us, spxMonthly, nvda };
   cache = { at: Date.now(), data };
   return data;
 }
