@@ -82,7 +82,7 @@ function interp(x, pts) {
   }
   return pts[pts.length - 1][1];
 }
-const KR_SCORE = {
+export const KR_SCORE = {
   pbr: (x) => clamp(interp(x, [[0.8, 10], [1.0, 35], [1.2, 55], [1.5, 75], [2.0, 92], [2.5, 100]])),
   fper: (x) => clamp(interp(x, [[6, 5], [8, 20], [10, 45], [12, 62], [14, 78], [17, 95]])),
   credit: (x) => clamp(interp(x, [[0.2, 10], [0.3, 20], [0.5, 40], [0.7, 58], [0.9, 75], [1.2, 95]])),

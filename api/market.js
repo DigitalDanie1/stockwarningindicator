@@ -197,6 +197,7 @@ export async function buildMarket() {
   if (m.buffett.kind === "snapshot") m.buffett = { label: "버핏 지수", value: r1(ANCHOR.buffett * spRatio), unit: "%", asOf: m.sp500.asOf, source: `앵커 ${ANCHOR.date} × 지수 (실시간 실패)`, kind: "estimate" };
   if (m.cape.kind === "snapshot") m.cape = { label: "CAPE", value: r1(ANCHOR.cape * spRatio), unit: "배", asOf: m.sp500.asOf, source: `앵커 ${ANCHOR.date} × 지수 (실시간 실패)`, kind: "estimate" };
   if (kr) errors.push(...kr.errors.map((e) => `kr ${e}`));
+  if (hist?.trendErrors?.length) errors.push(...hist.trendErrors.map((e) => `trend ${e}`));
 
   // 화면에 그리는 순서 유지
   const order = ["sp500", "nasdaq", "dow", "vix", "dgs10", "bill3m", "dxy", "gold", "wti", "btc", "kospi", "kosdaq", "fg", "curve", "ma200", "rsi", "buffett", "cape", "coreCpi", "headlineCpi", "hy"];
@@ -220,6 +221,10 @@ export async function buildMarket() {
     d("vix", "VIX", "", m.vix.value, SCORE.vixMacro(m.vix.value), 0.6),
   ];
 
+  const krComposite = kr?.drivers?.length >= 6
+    ? composite("한국 주식은?", kr.drivers, "live", `자동 수집 ${kr.drivers.length}개 · 네이버 증권·금융투자협회`)
+    : composite("한국 주식은?", KR_FALLBACK, "manual", "수집 실패 · 마지막 저장값");
+  const macroComposite = composite("경제는 버틸까?", macroDrivers, "live", "이자·물가·돈줄·금리곡선·공포지수");
   const usComposite = composite("미국 주식, 비싼가?", usDrivers, "live", usLive === 6 ? "지표 6개 모두 자동 수집" : `지표 6개 · 자동 ${usLive} + 어림 ${6 - usLive}`);
   const liveKeys = [...Object.keys(QUOTES), "kospi", "kosdaq"];
   const liveCount = liveKeys.filter((k) => m[k].kind === "live").length;
@@ -236,15 +241,17 @@ export async function buildMarket() {
     metrics: ordered,
     history: hist ? {
       us: hist.usHistory.map(({ d, v }, i, all) => ({ d, v: i === all.length - 1 ? usComposite.value : v })),
-      trend: Object.fromEntries(Object.entries(hist.trend).map(([k, arr]) => [k, arr.map((p, i) => (i === arr.length - 1 ? { ...p, v: usComposite.value, spx: Math.round(m.sp500.value) } : p))])),
+      trend: Object.fromEntries(Object.entries(hist.trend).map(([key, modes]) => {
+        const cur = { us: [usComposite.value, m.sp500.value], kr: [null, m.kospi.value], macro: [macroComposite.value, null] }[key];
+        return [key, Object.fromEntries(Object.entries(modes).map(([mode, arr]) => [mode, arr.map((p, i) => (i === arr.length - 1 && cur ? { ...p, ...(cur[0] != null ? { v: cur[0] } : {}), ...(cur[1] != null ? { spx: Math.round(cur[1]) } : {}) } : p))]))];
+      })),
+      assets: hist.assets ? Object.fromEntries(Object.entries(hist.assets).map(([k, a]) => [k, { label: a.label, ...Object.fromEntries(["weekly", "monthly", "yearly"].map((mode) => [mode, a[mode].map((p, i, arr) => (i === arr.length - 1 && m[k]?.kind === "live" ? { ...p, v: m[k].value } : p))])) }])) : null,
     } : null,
     series: hist ? { spxMonthly: hist.spxMonthly, nvda: hist.nvda } : null,
     scores: {
       us: usComposite,
-      kr: kr?.drivers?.length >= 6
-        ? composite("한국 주식은?", kr.drivers, "live", `자동 수집 ${kr.drivers.length}개 · 네이버 증권·금융투자협회`)
-        : composite("한국 주식은?", KR_FALLBACK, "manual", "수집 실패 · 마지막 저장값"),
-      macro: composite("경제는 버틸까?", macroDrivers, "live", "이자·물가·돈줄·금리곡선·공포지수"),
+      kr: krComposite,
+      macro: macroComposite,
     },
   };
 }

@@ -1,6 +1,7 @@
 // 최근 12개월 미국 위험점수 + S&P 월봉 — 실제 과거값으로 다시 계산
 import { getText, getJson, yahooChart, CNN_HEADERS } from "./_lib.js";
-import { r1, usScore } from "./_score.js";
+import { r1, SCORE, usScore } from "./_score.js";
+import { KR_SCORE } from "./_kr.js";
 
 const ym = (t) => new Date(t).toISOString().slice(0, 7);
 
@@ -76,7 +77,7 @@ async function nvdaSeries(nvM) {
 }
 
 // 정렬된 [ts, v] 배열에서 ts 이하 마지막 값
-function lastAt(arr, ts) {
+export function lastAt(arr, ts) {
   let lo = 0, hi = arr.length - 1, ans = -1;
   while (lo <= hi) { const m = (lo + hi) >> 1; if (arr[m][0] <= ts) { ans = m; lo = m + 1; } else hi = m - 1; }
   return ans;
@@ -142,11 +143,157 @@ export async function buildHistory() {
   const yearly = Array.from({ length: Y - 2000 + 1 }, (_, i) => pt(String(2000 + i), Math.min(Date.UTC(2001 + i, 0, 1) - 1, Date.now())));
   if (weekly[weekly.length - 1].d < now.toISOString().slice(0, 10)) weekly.push(pt(now.toISOString().slice(0, 10), Date.now()));
 
+  // 같은 시점들로 경제·한국 점수와 자산 가격도 계산
+  const ends = {
+    weekly: weekly.map((p) => [p.d, p.d === now.toISOString().slice(0, 10) ? Date.now() : Date.parse(p.d + "T23:59:00Z")]),
+    monthly: monthly.map((p, i) => [p.d, i === monthly.length - 1 ? Date.now() : Date.UTC(+p.d.slice(0, 4), +p.d.slice(5), 1) - 1]),
+    yearly: yearly.map((p, i) => [p.d, i === yearly.length - 1 ? Date.now() : Date.UTC(+p.d + 1, 0, 1) - 1]),
+  };
+  const extra = await buildExtraTrends(ends, vixD).catch((e) => ({ error: e.message }));
+
   const us = monthly.slice(-13);
   const spxMonthly = [...spxM].filter(([d]) => d >= "2019-01").map(([d, v]) => ({ d, v: Math.round(v * 100) / 100 }));
   const nvda = nvM ? await nvdaSeries(nvM).catch(() => null) : null;
   const strip = (a) => a.map(({ d, v, spx }) => ({ d, v, spx }));
-  const data = { usHistory: us, spxMonthly, nvda, trend: { weekly: strip(weekly), monthly: strip(monthly), yearly: strip(yearly) } };
+  const data = {
+    usHistory: us, spxMonthly, nvda,
+    trend: { us: { weekly: strip(weekly), monthly: strip(monthly), yearly: strip(yearly) }, ...(extra.scores ?? {}) },
+    assets: extra.assets ?? null,
+    trendErrors: extra.error ? [extra.error] : extra.errors ?? [],
+  };
   cache = { at: Date.now(), data };
   return data;
+}
+
+// ───────── 경제·한국 점수, 위험자산 가격 추이 ─────────
+const ASSETS = {
+  sp500: ["S&P 500", "^GSPC"], nasdaq: ["나스닥", "^IXIC"], dow: ["다우", "^DJI"],
+  kospi: ["코스피", "^KS11"], kosdaq: ["코스닥", "^KQ11"], btc: ["비트코인", "BTC-USD"],
+  gold: ["금", "GC=F"], wti: ["WTI 원유", "CL=F"], dxy: ["달러 지수", "DX-Y.NYB"],
+};
+
+async function fredDaily(id, from) {
+  const csv = await getText(`https://fred.stlouisfed.org/graph/fredgraph.csv?id=${id}&cosd=${from}`, { timeout: 15000 });
+  return csv.trim().split("\n").slice(1).map((l) => l.split(",")).map(([d, v]) => [Date.parse(d + "T00:00:00Z"), Number(v)]).filter(([, v]) => Number.isFinite(v));
+}
+
+async function kofia(objNm, from) {
+  const ymd = (d) => d.toISOString().slice(0, 10).replace(/-/g, "");
+  const r = await fetch("https://freesis.kofia.or.kr/meta/getMetaDataList.do", {
+    method: "POST",
+    headers: { "Content-Type": "application/json; charset=UTF-8", "User-Agent": "Mozilla/5.0", Referer: "https://freesis.kofia.or.kr/" },
+    body: JSON.stringify({ dmSearch: { tmpV40: "1000000", tmpV41: "1", tmpV1: "D", tmpV45: from, tmpV46: ymd(new Date()), OBJ_NM: objNm } }),
+  });
+  if (!r.ok) throw new Error(`FreeSIS ${objNm} ${r.status}`);
+  const rows = (await r.json()).ds1 ?? [];
+  return rows.map((x) => ({ ...x, ts: Date.UTC(+x.TMPV1.slice(0, 4), +x.TMPV1.slice(4, 6) - 1, +x.TMPV1.slice(6), 15) })).sort((a, b) => a.ts - b.ts);
+}
+
+async function ipoDates(fromIso) {
+  const out = [];
+  for (let page = 1; page <= 25; page++) {
+    const j = await getJson(`https://m.stock.naver.com/front-api/ipo/recent?gsrClass=G,S,R&page=${page}&pageSize=30`);
+    const list = j.result?.ipoList ?? [];
+    for (const x of list) out.push(Date.parse(x.lcalDate + "T00:00:00Z"));
+    if (!list.length || list[list.length - 1].lcalDate < fromIso) break;
+  }
+  return out.sort((a, b) => a - b);
+}
+
+// 시총 상위 40종목 장부가 합계(연도별) — PBR 과거값용
+async function bookByYear() {
+  const NV = "https://m.stock.naver.com";
+  const first = await getJson(`${NV}/api/stocks/marketValue/KOSPI?page=1&pageSize=40`);
+  const stocks = first.stocks.filter((s) => s.stockEndType === "stock");
+  const num = (v) => Number(String(v ?? "").replace(/,/g, ""));
+  const fins = await Promise.all(stocks.map((s) => getJson(`${NV}/api/stock/${s.itemCode}/finance/annual`).catch(() => null)));
+  const book = {}; let capNow = 0, bookNow = 0;
+  stocks.forEach((s, i) => {
+    const f = fins[i]?.financeInfo; if (!f) return;
+    const row = f.rowList.find((r) => r.title === "BPS"), pbrRow = f.rowList.find((r) => r.title === "PBR");
+    const cap = num(s.marketValue) * 1e8, price = num(s.closePrice);
+    if (!row || !price) return;
+    const shares = cap / price;
+    capNow += cap;
+    for (const t of f.trTitleList) {
+      if (t.isConsensus === "Y") continue;
+      const bps = num(row.columns[t.key]?.value);
+      if (bps > 0) book[t.key.slice(0, 4)] = (book[t.key.slice(0, 4)] ?? 0) + bps * shares;
+    }
+  });
+  return { book, capNow };
+}
+
+const sumW = (parts) => {
+  let w = 0, t = 0;
+  for (const [score, weight] of parts) if (Number.isFinite(score)) { w += weight; t += score * weight; }
+  return { v: w ? Math.round(t / w) : null, w };
+};
+
+async function buildExtraTrends(ends, vixD) {
+  const errors = [];
+  const safe = (p, label) => p.catch((e) => (errors.push(`${label}: ${e.message}`), null));
+  const [assetD, tnx, irx, cpi, hy, kospi, credit, samsung, ipos, books] = await Promise.all([
+    Promise.all(Object.entries(ASSETS).map(([k, [, sym]]) => safe(dailySeries(sym, 1999), k).then((d) => [k, d]))),
+    safe(dailySeries("^TNX", 1999), "tnx"), safe(dailySeries("^IRX", 1999), "irx"),
+    safe(fredDaily("CPILFESL", "1998-01-01"), "cpi"), safe(fredDaily("BAMLH0A0HYM2", "1999-01-01"), "hy"),
+    safe(kofia("STATSCU0100000020BO", "20000101"), "kospiStats"), safe(kofia("STATSCU0100000070BO", "20000101"), "credit"),
+    safe(dailySeries("005930.KS", 1999), "samsung"),
+    safe(ipoDates(`${new Date().getUTCFullYear() - 6}-01-01`), "ipo"), safe(bookByYear(), "book"),
+  ]);
+  const D = Object.fromEntries(assetD);
+
+  // 삼성 주식 수: 지금 시총 ÷ 지금 주가 (네이버)
+  let samShares = null;
+  try {
+    const j = await getJson("https://m.stock.naver.com/api/stock/005930/integration");
+    const v = (c) => Number(String(j.totalInfos.find((x) => x.code === c)?.value ?? "").replace(/[^0-9.]/g, ""));
+    const capStr = j.totalInfos.find((x) => x.code === "marketValue")?.value ?? "";
+    const jo = Number((capStr.match(/([\d,]+)조/) ?? [, "0"])[1].replace(/,/g, "")), eok = Number((capStr.match(/([\d,]+)억/) ?? [, "0"])[1].replace(/,/g, ""));
+    samShares = ((jo * 1e4 + eok) * 1e8) / v("lastClosePrice");
+  } catch (e) { errors.push(`samShares: ${e.message}`); }
+
+  // 외국인 순매수 추정: 외국인 보유 시총 변화 − 가격 변동분
+  const fNet = [0];
+  if (kospi) for (let i = 1; i < kospi.length; i++) {
+    const a = kospi[i - 1], b = kospi[i];
+    fNet.push(fNet[i - 1] + (b.TMPV6 - a.TMPV6 - a.TMPV6 * (b.TMPV5 / a.TMPV5 - 1)));
+  }
+  const cpiYoY = cpi ? cpi.map(([t, v], i) => { const p = cpi.find(([tt]) => new Date(tt).getUTCFullYear() === new Date(t).getUTCFullYear() - 1 && new Date(tt).getUTCMonth() === new Date(t).getUTCMonth()); return p ? [t + 45 * 864e5, (v / p[1] - 1) * 100] : null; }).filter(Boolean) : null; // 발표 지연 반영(+45일)
+  const val = (arr, end, maxAge = 10) => { if (!arr) return null; const i = lastAt(arr, end); return i >= 0 && end - arr[i][0] < maxAge * 864e5 ? arr[i][1] : null; };
+  const kRows = kospi?.map((r) => [r.ts, r]); const cRows = credit?.map((r) => [r.ts, r]);
+
+  const scores = { kr: {}, macro: {} }, assets = {};
+  for (const [mode, list] of Object.entries(ends)) {
+    scores.macro[mode] = list.map(([d, end]) => {
+      const t = val(tnx, end), b = val(irx, end), vx = val(vixD, end), c = val(cpiYoY, end, 75), h = val(hy, end);
+      const { v } = sumW([[t != null ? SCORE.dgs10(t) : NaN, 1], [c != null ? SCORE.coreCpi(c) : NaN, 1], [h != null ? SCORE.hy(h) : NaN, 0.8], [t != null && b != null ? SCORE.curve(t - b) : NaN, 0.7], [vx != null ? SCORE.vixMacro(vx) : NaN, 0.6]]);
+      return { d, v };
+    });
+    scores.kr[mode] = list.map(([d, end]) => {
+      const ki = kRows ? lastAt(kRows, end) : -1;
+      if (ki < 0 || end - kRows[ki][0] > 10 * 864e5) return { d, v: null, spx: null };
+      const k = kRows[ki][1], capW = k.TMPV5 * 1e6; // 원
+      const parts = [];
+      const cr = cRows ? val(cRows.map(([t, r]) => [t, r.TMPV3]), end) : null;
+      if (cr != null) parts.push([KR_SCORE.credit((cr * 1e6) / capW * 100), 0.85]);
+      // 3개월(63거래일) 외국인 순매수 추정, 조 원
+      if (ki >= 63) parts.push([KR_SCORE.foreign((fNet[ki] - fNet[ki - 63]) / 1e6), 0.75]);
+      const sp = val(samsung, end);
+      if (sp != null && samShares) parts.push([KR_SCORE.samsung((sp * samShares) / capW * 100), 0.7]);
+      parts.push([KR_SCORE.turnover((k.TMPV4 / k.TMPV5) * 100), 0.6]);
+      if (ipos && end >= ipos[0] + 30 * 864e5) parts.push([KR_SCORE.ipo(ipos.filter((t) => t <= end && t > end - 30 * 864e5).length), 0.65]);
+      if (books) {
+        const y = new Date(end).getUTCFullYear() - 1, bk = books.book[String(y)];
+        if (bk) parts.push([KR_SCORE.pbr((capW * (books.capNow / (kospi[kospi.length - 1].TMPV5 * 1e6))) / bk), 1]);
+      }
+      const { v, w } = sumW(parts);
+      return { d, v: w >= 2 ? v : null, spx: Math.round(k.TMPV2) };
+    });
+    for (const [k, [label]] of Object.entries(ASSETS)) {
+      assets[k] ??= { label };
+      assets[k][mode] = list.map(([d, end]) => { const x = D[k] ? val(D[k], end, 7) : null; return { d, v: x != null ? Math.round(x * 100) / 100 : null }; });
+    }
+  }
+  return { scores, assets, errors };
 }
