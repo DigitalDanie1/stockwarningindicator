@@ -29,33 +29,8 @@ const KR_FALLBACK = [
   { id: "ipo", name: "IPO 30일", unit: "건", raw: 5, score: 42, weight: 0.65 },
 ];
 
-const r2 = (x) => Math.round(x * 100) / 100;
-const r1 = (x) => Math.round(x * 10) / 10;
-const clamp = (x) => Math.max(0, Math.min(100, x));
-// 구간 선형 보간 — 점은 x 오름차순
-function interp(x, pts) {
-  if (x <= pts[0][0]) return pts[0][1];
-  for (let i = 1; i < pts.length; i++) {
-    const [x0, y0] = pts[i - 1], [x1, y1] = pts[i];
-    if (x <= x1) return y0 + ((y1 - y0) * (x - x0)) / (x1 - x0);
-  }
-  return pts[pts.length - 1][1];
-}
-
-// 점수 곡선 — 9/9·9/10 두 스냅샷의 점수를 그대로 재현하도록 맞춘 것
-const SCORE = {
-  buffett: (x) => clamp(interp(x, [[70, 0], [100, 30], [150, 70], [190, 88], [237.5, 100]])),
-  shiller: (x) => clamp(interp(x, [[10, 0], [17, 25], [25, 60], [30, 80.2], [43.2, 100]])),
-  vixUs: (x) => clamp(57.7 - 5.405 * (x - 16.46)),
-  fg: (x) => clamp(x + 1.9),
-  ma200: (x) => clamp(45 + 3 * x),
-  rsi: (x) => clamp(41.8 + 1.4706 * (x - 47.5)),
-  dgs10: (x) => clamp(79.6 + 36.67 * (x - 4.84)),
-  coreCpi: (x) => clamp(44.1 + 30 * (x - 2.47)),
-  hy: (x) => clamp(24.8 + 15 * (x - 2.65)),
-  curve: (x) => clamp(31.6 - 30 * (x - 1.03)),
-  vixMacro: (x) => clamp(30.8 + 3.92 * (x - 16.46)),
-};
+import { r1, r2, clamp, interp, SCORE } from "./_score.js";
+import { buildHistory } from "./_history.js";
 
 function band(v) {
   if (v >= 80) return ["매우 높음 · 경고", "red"];
@@ -198,8 +173,9 @@ export async function buildMarket() {
     }
   };
 
-  let tech = null, kr = null;
+  let tech = null, kr = null, hist = null;
   await Promise.all([
+    buildHistory().then((h) => (hist = h)).catch((e) => errors.push(`history: ${e.message}`)),
     settle("buffett", "버핏 지수", "%", buffettLive),
     settle("cape", "CAPE", "배", capeLive),
     buildKr().then((k) => (kr = k)).catch((e) => errors.push(`kr: ${e.message}`)),
@@ -244,6 +220,7 @@ export async function buildMarket() {
     d("vix", "VIX", "", m.vix.value, SCORE.vixMacro(m.vix.value), 0.6),
   ];
 
+  const usComposite = composite("미국 주식, 비싼가?", usDrivers, "live", usLive === 6 ? "지표 6개 모두 자동 수집" : `지표 6개 · 자동 ${usLive} + 어림 ${6 - usLive}`);
   const liveKeys = [...Object.keys(QUOTES), "kospi", "kosdaq"];
   const liveCount = liveKeys.filter((k) => m[k].kind === "live").length;
   const dataAsOf = liveKeys.filter((k) => m[k].kind === "live").map((k) => m[k].asOf)
@@ -257,8 +234,10 @@ export async function buildMarket() {
     liveTotal: liveKeys.length,
     errors,
     metrics: ordered,
+    history: hist ? { us: hist.usHistory.map(({ d, v }, i, all) => ({ d, v: i === all.length - 1 ? usComposite.value : v })) } : null,
+    series: hist ? { spxMonthly: hist.spxMonthly } : null,
     scores: {
-      us: composite("미국 주식, 비싼가?", usDrivers, "live", usLive === 6 ? "지표 6개 모두 자동 수집" : `지표 6개 · 자동 ${usLive} + 어림 ${6 - usLive}`),
+      us: usComposite,
       kr: kr?.drivers?.length >= 6
         ? composite("한국 주식은?", kr.drivers, "live", `자동 수집 ${kr.drivers.length}개 · 네이버 증권·금융투자협회`)
         : composite("한국 주식은?", KR_FALLBACK, "manual", "수집 실패 · 마지막 저장값"),
