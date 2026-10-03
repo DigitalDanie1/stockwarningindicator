@@ -149,7 +149,7 @@ export async function buildHistory() {
     monthly: monthly.map((p, i) => [p.d, i === monthly.length - 1 ? Date.now() : Date.UTC(+p.d.slice(0, 4), +p.d.slice(5), 1) - 1]),
     yearly: yearly.map((p, i) => [p.d, i === yearly.length - 1 ? Date.now() : Date.UTC(+p.d + 1, 0, 1) - 1]),
   };
-  const extra = await buildExtraTrends(ends, vixD).catch((e) => ({ error: e.message }));
+  const extra = await buildExtraTrends(ends, vixD, cape).catch((e) => ({ error: e.message }));
 
   const us = monthly.slice(-13);
   const spxMonthly = [...spxM].filter(([d]) => d >= "2019-01").map(([d, v]) => ({ d, v: Math.round(v * 100) / 100 }));
@@ -159,6 +159,7 @@ export async function buildHistory() {
     usHistory: us, spxMonthly, nvda,
     trend: { us: { weekly: strip(weekly), monthly: strip(monthly), yearly: strip(yearly) }, ...(extra.scores ?? {}) },
     assets: extra.assets ?? null,
+    warsh: extra.warsh ?? null,
     trendErrors: extra.error ? [extra.error] : extra.errors ?? [],
   };
   cache = { at: Date.now(), data };
@@ -230,7 +231,7 @@ const sumW = (parts) => {
   return { v: w ? Math.round(t / w) : null, w };
 };
 
-async function buildExtraTrends(ends, vixD) {
+async function buildExtraTrends(ends, vixD, cape) {
   const errors = [];
   const safe = (p, label) => p.catch((e) => (errors.push(`${label}: ${e.message}`), null));
   const [assetD, tnx, irx, cpi, hy, kospi, credit, samsung, ipos, books] = await Promise.all([
@@ -241,6 +242,7 @@ async function buildExtraTrends(ends, vixD) {
     safe(dailySeries("005930.KS", 1999), "samsung"),
     safe(ipoDates(`${new Date().getUTCFullYear() - 6}-01-01`), "ipo"), safe(bookByYear(), "book"),
   ]);
+  const [fedTop, spxLong] = await Promise.all([safe(fredDaily("DFEDTARU", "2015-01-01"), "fedfunds"), safe(dailySeries("^GSPC", 1993), "spxLong")]);
   const D = Object.fromEntries(assetD);
 
   // 삼성 주식 수: 지금 시총 ÷ 지금 주가 (네이버)
@@ -295,5 +297,45 @@ async function buildExtraTrends(ends, vixD) {
       assets[k][mode] = list.map(([d, end]) => { const x = D[k] ? val(D[k], end, 7) : null; return { d, v: x != null ? Math.round(x * 100) / 100 : null }; });
     }
   }
-  return { scores, assets, errors };
+  // ── 워시 취임(2026-05-22) 이후 변화: 취임 전날 종가 → 지금
+  const W0 = Date.parse("2026-05-21T23:59:00Z");
+  const since = (arr, label, unit, kind = "pct") => {
+    if (!arr) return null;
+    const i = lastAt(arr, W0); if (i < 0) return null;
+    const b = arr[i][1], n = arr[arr.length - 1][1];
+    return { label, unit, base: Math.round(b * 100) / 100, now: Math.round(n * 100) / 100, chg: kind === "pt" ? Math.round((n - b) * 100) / 100 : Math.round((n / b - 1) * 1000) / 10, kind };
+  };
+  const warshItems = [
+    since(fedTop, "기준금리 (상단)", "%", "pt"), since(tnx, "미국 10년 금리", "%", "pt"), since(irx, "미국 3개월 금리", "%", "pt"),
+    since(D.dxy, "달러 지수", ""), since(D.sp500, "S&P 500", ""), since(D.nasdaq, "나스닥", ""),
+    since(D.kospi, "코스피", ""), since(D.gold, "금", "$"), since(D.btc, "비트코인", "$"), since(D.wti, "WTI 원유", "$"),
+  ].filter(Boolean);
+
+  // ── 첫 금리 인상 뒤 주가는 얼마나 더 올랐나 (15% 이상 빠지기 전 꼭대기까지)
+  const HIKES = [
+    ["1994-02-04", "1994년 2월", "인플레 선제 대응"], ["1999-06-30", "1999년 6월", "닷컴 막바지, 98년 인하 직후 재인상"],
+    ["2004-06-30", "2004년 6월", "집값 거품기"], ["2015-12-16", "2015년 12월", "제로금리 탈출"],
+    ["2022-03-16", "2022년 3월", "물가 9% 대응"], ["2026-09-16", "2026년 9월", "워시 체제 첫 인상 (지금)"],
+  ];
+  const analogs = spxLong ? HIKES.map(([d, label, why]) => {
+    const t0 = Date.parse(d + "T23:59:00Z"), i0 = lastAt(spxLong, t0);
+    if (i0 < 0) return null;
+    const base = spxLong[i0][1];
+    let peakI = i0, end = null;
+    for (let i = i0; i < spxLong.length; i++) {
+      if (spxLong[i][1] > spxLong[peakI][1]) peakI = i;
+      if (spxLong[i][1] <= spxLong[peakI][1] * 0.85) { end = i; break; }
+    }
+    let trough = null;
+    if (end != null) { let lo = end; for (let i = end; i < spxLong.length && spxLong[i][1] < spxLong[peakI][1]; i++) if (spxLong[i][1] < spxLong[lo][1]) lo = i; trough = Math.round((spxLong[lo][1] / spxLong[peakI][1] - 1) * 100); }
+    const months = Math.round(((spxLong[peakI][0] - spxLong[i0][0]) / (30.44 * 864e5)) * 10) / 10;
+    return {
+      date: d, label, why, cape: cape?.get(d.slice(0, 7)) ?? null, ongoing: end == null,
+      months, gain: Math.round((spxLong[peakI][1] / base - 1) * 1000) / 10,
+      peakDate: new Date(spxLong[peakI][0]).toISOString().slice(0, 10), drop: trough,
+      elapsed: Math.round(((Date.now() - t0) / (30.44 * 864e5)) * 10) / 10,
+    };
+  }).filter(Boolean) : null;
+
+  return { scores, assets, errors, warsh: { since: "2026-05-22", items: warshItems, analogs } };
 }

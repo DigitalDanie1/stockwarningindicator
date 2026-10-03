@@ -245,6 +245,7 @@ export async function buildMarket() {
         const cur = { us: [usComposite.value, m.sp500.value], kr: [null, m.kospi.value], macro: [macroComposite.value, null] }[key];
         return [key, Object.fromEntries(Object.entries(modes).map(([mode, arr]) => [mode, arr.map((p, i) => (i === arr.length - 1 && cur ? { ...p, ...(cur[0] != null ? { v: cur[0] } : {}), ...(cur[1] != null ? { spx: Math.round(cur[1]) } : {}) } : p))]))];
       })),
+      warsh: hist.warsh,
       assets: hist.assets ? Object.fromEntries(Object.entries(hist.assets).map(([k, a]) => [k, { label: a.label, ...Object.fromEntries(["weekly", "monthly", "yearly"].map((mode) => [mode, a[mode].map((p, i, arr) => (i === arr.length - 1 && m[k]?.kind === "live" ? { ...p, v: m[k].value } : p))])) }])) : null,
     } : null,
     series: hist ? { spxMonthly: hist.spxMonthly, nvda: hist.nvda } : null,
